@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#102b25">
+  <meta name="theme-color" content="#0052fe">
   <meta name="description" content="Поставки Цифрового Рая. Выбирайте товары в пути и оформляйте резерв.">
   <title>CR Reserve — Поставки</title>
-  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="./brand-logo.png" type="image/png">
   <link rel="stylesheet" href="./style.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script defer src="./jszip.min.js"></script>
   <script type="module" src="./app.js"></script>
 </head>
 <body>
-  <header class="topbar"><a class="brand" href="#"><span class="brand-mark">CR</span><span>ЦИФРОВОЙ РАЙ<small>Резерв поставок</small></span></a><button id="refresh" class="icon-button" aria-label="Обновить">↻</button></header>
+  <header class="topbar"><a class="brand" href="#"><svg class="brand-mark" viewBox="730 80 610 550" aria-hidden="true" focusable="false"><image href="./brand-logo.png" width="2048" height="1024"/></svg><span>ЦИФРОВОЙ РАЙ<small>Резерв поставок</small></span></a><button id="refresh" class="icon-button" aria-label="Обновить">↻</button></header>
   <div id="notice" class="notice" hidden></div>
   <main id="app" aria-live="polite"><p class="empty">Загружаем поставки…</p></main>
   <nav class="bottom-nav" aria-label="Основная навигация"><button data-view="shipments" class="active">Поставки</button><button data-view="reservations">Мои резервы</button><button data-view="admin" id="admin-tab" hidden>Управление</button></nav>

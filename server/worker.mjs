@@ -1,0 +1,120 @@
+import {authenticate,isAdmin,ApiError} from './auth.mjs';
+import {Inventory} from './store.mjs';
+
+function json(data,status=200) { return Response.json(data,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}}); }
+async function readJson(request) {
+  if(!request.headers.get('Content-Type')?.includes('application/json')) throw new ApiError(415,'Ожидается JSON.');
+  if(Number(request.headers.get('Content-Length'))>15000000) throw new ApiError(413,'Файл слишком большой.');
+  const body=await request.text();
+  if(body.length>15000000) throw new ApiError(413,'Файл слишком большой.');
+  try { const value=JSON.parse(body); if(!value || typeof value !== 'object' || Array.isArray(value)) throw Error(); return value; } catch { throw new ApiError(400,'Некорректный JSON.'); }
+}
+async function telegram(env,method,body) {
+  const response=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(15000)});
+  const result=await response.json();
+  if(!response.ok || !result.ok) throw new Error('Telegram request failed');
+  return result.result;
+}
+
+export class ReserveStore {
+  constructor(ctx,env) {
+    this.ctx=ctx; this.env=env;
+    this.inventory=new Inventory(ctx.storage.sql,fn=>ctx.storage.transactionSync(fn));
+    this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS bot_updates (id INTEGER PRIMARY KEY)');
+  }
+  async fetch(request) {
+    try {
+      const url=new URL(request.url),path=url.pathname;
+      if(path==='/api/bootstrap') return json({mode:this.env.BOT_TOKEN?'live':'preview',notificationReady:Boolean(this.env.RESERVATION_CHAT_ID),botUsername:this.env.BOT_USERNAME});
+      if(path==='/telegram/webhook') return await this.webhook(request);
+      const user=await authenticate(request.headers.get('X-Telegram-Init-Data'),this.env.BOT_TOKEN);
+      const admin=isAdmin(user,this.env);
+      if(path==='/api/me' && request.method==='GET') return json({user,admin});
+      if(path==='/api/catalog' && request.method==='GET') return json({shipments:this.inventory.catalog(admin)});
+      if(path==='/api/reservations' && request.method==='GET') return json({reservations:this.inventory.reservations(user,admin && url.searchParams.get('all')==='1')});
+      if(path==='/api/reservations' && request.method==='POST') {
+        if(!this.env.RESERVATION_CHAT_ID) throw new ApiError(503,'Приём резервов пока не открыт.');
+        const input=await readJson(request);
+        await this.ensureAlarm();
+        const reservation=this.inventory.reserve(user,input);
+        this.ctx.waitUntil(this.flush());
+        return json({reservation},201);
+      }
+      if(/^\/api\/reservations\/[a-f0-9-]+$/.test(path) && request.method==='PATCH') {
+        const input=await readJson(request);
+        await this.ensureAlarm();
+        const reservation=this.inventory.changeReservation(user,path.split('/').pop(),input.status,admin);
+        this.ctx.waitUntil(this.flush());
+        return json({reservation});
+      }
+      if(path==='/api/admin/shipments' && request.method==='POST') {
+        if(!admin) throw new ApiError(403,'Раздел доступен только владельцу.');
+        return json({shipment:this.inventory.importShipment(await readJson(request))});
+      }
+      throw new ApiError(404,'Маршрут не найден.');
+    } catch(error) {
+      if(!(error instanceof ApiError)) console.error('Request failed:',error.name);
+      return json({error:error instanceof ApiError?error.message:'Не удалось выполнить запрос. Попробуйте ещё раз.'},error.status || 500);
+    }
+  }
+  async ensureAlarm() { if(!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now()+30000); }
+  async flush() {
+    if(this.flushing) return;
+    this.flushing=true;
+    try {
+      if(!this.env.RESERVATION_CHAT_ID || !this.env.BOT_TOKEN) return;
+      for(const row of this.inventory.rows('SELECT id,data FROM outbox WHERE sent=0 ORDER BY rowid LIMIT 20')) {
+        const data=JSON.parse(row.data);
+        await telegram(this.env,'sendMessage',{chat_id:this.env.RESERVATION_CHAT_ID,text:data.text});
+        this.inventory.sql.exec('UPDATE outbox SET sent=1 WHERE id=?',row.id);
+      }
+    } catch { console.warn('Notification pending; scheduled retry'); }
+    finally {
+      this.flushing=false;
+      if(this.inventory.one('SELECT id FROM outbox WHERE sent=0 LIMIT 1')) await this.ensureAlarm();
+    }
+  }
+  async alarm() {
+    // Re-arm before external I/O. A crash cannot strand a committed notification.
+    await this.ctx.storage.setAlarm(Date.now()+60000);
+    await this.flush();
+    if(!this.inventory.one('SELECT id FROM outbox WHERE sent=0 LIMIT 1')) await this.ctx.storage.deleteAlarm();
+  }
+  async webhook(request) {
+    if(request.method!=='POST' || !this.env.WEBHOOK_SECRET || request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==this.env.WEBHOOK_SECRET) return json({error:'Forbidden'},403);
+    const update=await readJson(request);
+    if(!Number.isSafeInteger(update.update_id)) return json({error:'Invalid update'},400);
+    if(this.inventory.one('SELECT id FROM bot_updates WHERE id=?',update.update_id)) return json({ok:true});
+    const message=update.message;
+    if(message?.chat?.type==='private' && message.from) {
+      const command=(message.text || '').split(' ')[0];
+      let text=null;
+      if(command==='/id') text=`Ваш Telegram ID: ${message.from.id}`;
+      if(command==='/start') text='Откройте поставки, выберите товары и оформите резерв. Свободное количество обновляется после каждого резерва.';
+      const admin=isAdmin({id:message.from.id},this.env);
+      if(command==='/admin' && admin) text='Откройте приложение → Управление. Здесь можно загрузить Excel, опубликовать поставку и обработать резервы.';
+      if(message.forward_origin?.type==='channel' && admin) text=`ID канала: ${message.forward_origin.chat.id}\nДобавьте бота администратором с правом публикации, затем укажите этот ID в RESERVATION_CHAT_ID.`;
+      if(message.document && admin) text='Для загрузки Excel откройте приложение → Управление → Новая поставка. Импорт покажет ошибки и позволит проверить данные до публикации.';
+      if(text) await telegram(this.env,'sendMessage',{chat_id:message.chat.id,text,reply_markup:{inline_keyboard:[[{text:'Открыть поставки',url:this.env.MINI_APP_URL || 'https://t.me/CR_Reserve_Bot/CR_Reserve'}]]}});
+    }
+    this.inventory.sql.exec('INSERT OR IGNORE INTO bot_updates(id) VALUES(?)',update.update_id);
+    this.inventory.sql.exec('DELETE FROM bot_updates WHERE id < ?',update.update_id-10000);
+    return json({ok:true});
+  }
+}
+
+export default {
+  async fetch(request,env) {
+    const path=new URL(request.url).pathname;
+    if(path.startsWith('/api/') || path==='/telegram/webhook') {
+      if(request.headers.get('Origin') && request.headers.get('Origin')!==new URL(request.url).origin) return json({error:'Forbidden'},403);
+      return env.STORE.get(env.STORE.idFromName('cr-reserve-v1')).fetch(request);
+    }
+    const response=await env.ASSETS.fetch(request);
+    const headers=new Headers(response.headers);
+    headers.set('X-Content-Type-Options','nosniff');
+    headers.set('Referrer-Policy','strict-origin-when-cross-origin');
+    headers.set('Content-Security-Policy',"default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors https://web.telegram.org https://*.telegram.org");
+    return new Response(response.body,{status:response.status,headers});
+  }
+};

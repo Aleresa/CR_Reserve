@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "cr-reserve",
+  "main": "server/worker.mjs",
+  "compatibility_date": "2026-09-22",
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*", "/telegram/webhook"] },
+  "durable_objects": { "bindings": [{ "name": "STORE", "class_name": "ReserveStore" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReserveStore"] }],
+  "vars": {
+    "BOT_USERNAME": "CR_Reserve_Bot",
+    "MINI_APP_URL": "https://t.me/CR_Reserve_Bot/CR_Reserve"
+  }
+}

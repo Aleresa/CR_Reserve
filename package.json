@@ -1,0 +1,13 @@
+{
+  "name": "cr-reserve",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "dev": "npx wrangler@4 dev",
+    "deploy": "npx wrangler@4 deploy",
+    "preview": "node scripts/preview.mjs"
+  },
+  "engines": { "node": ">=22.13" }
+}

@@ -62,8 +62,22 @@ try{
   assert.equal(store.inventory.reservations({id:'123'})[0].manager.username,'ivan_test');
   assert.match(JSON.parse(store.inventory.rows('SELECT data FROM outbox')[0].data).text,/Менеджер: Иван @ivan_test/);
   assert.equal(store.inventory.catalog().find(s=>s.id==='demo').products[0].stock,9);
+  await page.locator('[data-edit-reservation]').click();await page.waitForSelector('[data-edit-qty]');
+  const firstProduct=store.inventory.catalog()[0].products[0],secondProduct=store.inventory.catalog()[0].products[1];
+  await page.locator('[data-edit-qty]').first().fill('3');
+  await page.locator('#add-reservation-product').selectOption(secondProduct.id);
+  await page.locator(`[data-edit-qty="${secondProduct.id}"]`).fill('2');
+  await page.locator('#edit-reservation-comment').fill('Изменённый резерв');
+  await page.screenshot({path:'test-results/edit-reservation.png',fullPage:true});
+  await page.locator('#save-reservation').click();await page.waitForSelector('#edit-reservation-form',{state:'hidden'});await page.waitForSelector('[data-edit-reservation]');
+  assert.deepEqual(store.inventory.catalog()[0].products.map(p=>p.stock),[7,3]);
+  const changed=store.inventory.reservations({id:'123'})[0];assert.equal(changed.comment,'Изменённый резерв');assert.equal(changed.revision,2);
+  await page.locator('[data-edit-reservation]').click();await page.waitForSelector('[data-edit-qty]');
+  await page.locator(`[data-edit-qty="${firstProduct.id}"]`).fill('0');await page.locator(`[data-edit-qty="${secondProduct.id}"]`).fill('1');
+  await page.locator('#save-reservation').click();await page.waitForSelector('#edit-reservation-form',{state:'hidden'});await page.waitForSelector('[data-cancel]');
+  assert.deepEqual(store.inventory.catalog()[0].products.map(p=>p.stock),[10,4]);
   await page.locator('[data-cancel]').click();await page.locator('#confirm-action').click();await page.waitForSelector('.badge.cancelled');
-  assert.equal(store.inventory.catalog().find(s=>s.id==='demo').products[0].stock,10);
+  assert.deepEqual(store.inventory.catalog()[0].products.map(p=>p.stock),[10,5]);
   await page.locator('#admin-tab').click();await page.locator('#new-shipment').click();
   // A minimal XLSX with inline strings verifies the same import UI used for supplier files.
   const z=new JSZip();

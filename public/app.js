@@ -14,7 +14,7 @@ function notice(text){$('#notice').textContent=text;$('#notice').hidden=!text;}
 async function api(path,method='GET',body){
   const response=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(25000)});
   const data=await response.json();
-  if(!response.ok)throw Error(data.error||'Не удалось выполнить запрос.');
+  if(!response.ok){const error=Error(data.error||'Не удалось выполнить запрос.');error.status=response.status;throw error;}
   return data;
 }
 async function init(){
@@ -144,15 +144,51 @@ async function renderReservations(all=false){
   try{
     const {reservations}=await api('/reservations'+(all?'?all=1':''));state.reservations=reservations;
     if(!$('#reservations'))return;
-    $('#reservations').innerHTML=reservations.length?reservations.map(r=>`<article class="reservation"><div class="top"><div><small>№ ${esc(r.id.slice(0,8))} · ${date(r.createdAt)}</small><h3 style="margin-top:8px">${esc(r.shipmentTitle)}</h3></div>${badge(r.status)}</div>${all?`<p>${esc(r.user.name)} ${r.user.username?'@'+esc(r.user.username):''}</p>`:''}${r.manager?`<p class="muted">Менеджер: ${esc(r.manager.name)} · @${esc(r.manager.username)}</p>`:''}<strong>${money(r.total)}</strong><span class="muted"> · ${r.lines.reduce((s,l)=>s+l.quantity,0)} шт.</span><details><summary>Состав резерва</summary><ul>${r.lines.map(l=>`<li>${esc(l.sku)} · ${esc(l.name)} — <b>${l.quantity} шт.</b></li>`).join('')}</ul>${r.comment?`<p>${esc(r.comment)}</p>`:''}</details><div class="actions">${all&&r.status==='reserved'?`<button class="primary" data-confirm="${r.id}">Подтвердить</button>`:''}${r.status==='reserved'||all&&r.status==='confirmed'?`<button class="danger" data-cancel="${r.id}">Отменить резерв</button>`:''}</div></article>`).join(''):'<div class="empty"><strong>Резервов пока нет</strong>Выберите поставку и добавьте нужные товары.</div>';
+    $('#reservations').innerHTML=reservations.length?reservations.map(r=>`<article class="reservation"><div class="top"><div><small>№ ${esc(r.id.slice(0,8))} · ${date(r.createdAt)}</small><h3 style="margin-top:8px">${esc(r.shipmentTitle)}</h3></div>${badge(r.status)}</div>${r.editedAt?'<p class="muted">Резерв изменён</p>':''}${all?`<p>${esc(r.user.name)} ${r.user.username?'@'+esc(r.user.username):''}</p>`:''}${r.manager?`<p class="muted">Менеджер: ${esc(r.manager.name)} · @${esc(r.manager.username)}</p>`:''}<strong>${money(r.total)}</strong><span class="muted"> · ${r.lines.reduce((s,l)=>s+l.quantity,0)} шт.</span><details><summary>Состав резерва</summary><ul>${r.lines.map(l=>`<li>${esc(l.sku)} · ${esc(l.name)} — <b>${l.quantity} шт.</b></li>`).join('')}</ul>${r.comment?`<p>${esc(r.comment)}</p>`:''}</details><div class="actions">${r.status==='reserved'||all&&r.status==='confirmed'?`<button class="secondary" data-edit-reservation="${r.id}">Изменить</button>`:''}${all&&r.status==='reserved'?`<button class="primary" data-confirm="${r.id}">Подтвердить</button>`:''}${r.status==='reserved'||all&&r.status==='confirmed'?`<button class="danger" data-cancel="${r.id}">Отменить резерв</button>`:''}</div></article>`).join(''):'<div class="empty"><strong>Резервов пока нет</strong>Выберите поставку и добавьте нужные товары.</div>';
+    document.querySelectorAll('[data-edit-reservation]').forEach(b=>b.onclick=()=>editReservationForm(reservations.find(r=>r.id===b.dataset.editReservation),all));
     document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>changeReservation(b.dataset.cancel,'cancelled',all));
     document.querySelectorAll('[data-confirm]').forEach(b=>b.onclick=()=>changeReservation(b.dataset.confirm,'confirmed',all));
     if(all)$('#export').onclick=()=>exportReservations(reservations).catch(e=>toast(e.message));
   }catch(e){if($('#reservations'))$('#reservations').innerHTML=`<p class="empty error">${esc(e.message)}</p>`;}
 }
+async function editReservationForm(reservation,all){
+  let shipment;
+  try{shipment=(await api('/catalog')).shipments.find(s=>s.id===reservation.shipmentId);if(!shipment)throw Error('Поставка недоступна. Обратитесь к менеджеру.');}catch(e){toast(e.message);return;}
+  const originals=new Map(reservation.lines.map(l=>[l.id,l])),draft=new Map(reservation.lines.map(l=>[l.id,l.quantity]));
+  let requestKey=null;
+  showDialog('Изменить резерв',`<p class="muted">${esc(reservation.shipmentTitle)}</p><p class="fine-print">Поставьте 0, чтобы убрать позицию. Увеличение количества возможно в пределах свободного остатка. Для полного отказа отмените резерв.</p><form id="edit-reservation-form"><div id="edit-reservation-lines"></div><label class="field">Добавить товар<select id="add-reservation-product"><option value="">Выберите товар</option></select></label><p class="fine-print">Цена ранее выбранных позиций сохраняется. Новые позиции добавляются по текущей цене.</p><label class="field">Комментарий<textarea id="edit-reservation-comment" maxlength="1000">${esc(reservation.comment)}</textarea></label><p class="cart-total" id="edit-reservation-total"></p><p id="edit-reservation-error" class="error" role="alert"></p><button type="button" class="secondary full" id="reload-reservations" hidden>Обновить список резервов</button><button class="primary full" type="submit" id="save-reservation">Сохранить изменения</button></form>`);
+  const form=$('#edit-reservation-form');
+  const price=id=>originals.get(id)?.price??shipment.products.find(p=>p.id===id)?.price??0;
+  function total(){const sum=[...draft].reduce((n,[id,q])=>n+q*price(id),0);$('#edit-reservation-total').textContent='Итого: '+money(sum);}
+  function draw(){
+    $('#edit-reservation-lines').innerHTML=[...draft].map(([id,quantity])=>{
+      const p=shipment.products.find(p=>p.id===id),old=originals.get(id),max=(p?.stock||0)+(old?.quantity||0);
+      return `<div class="cart-line"><p>${esc(old?.name||p?.name)}</p><span class="muted">${esc(old?.sku||p?.sku)} · ${money(price(id))} · Доступно с вашим резервом: ${max} шт.</span><label class="field">Количество<input data-edit-qty="${esc(id)}" type="number" inputmode="numeric" required min="0" max="${max}" step="1" value="${quantity}"></label></div>`;
+    }).join('');
+    form.querySelectorAll('[data-edit-qty]').forEach(el=>el.oninput=()=>{draft.set(el.dataset.editQty,Number(el.value));requestKey=null;total();});
+    $('#add-reservation-product').innerHTML='<option value="">Выберите товар</option>'+shipment.products.filter(p=>p.stock>0&&!draft.has(p.id)).map(p=>`<option value="${esc(p.id)}">${esc(p.sku)} · ${esc(p.name)} · ${money(p.price)}</option>`).join('');
+    total();
+  }
+  draw();
+  $('#add-reservation-product').onchange=e=>{if(e.target.value){draft.set(e.target.value,1);requestKey=null;draw();}};
+  $('#edit-reservation-comment').oninput=()=>requestKey=null;
+  $('#reload-reservations').onclick=()=>{closeDialog();renderReservations(all);};
+  form.onsubmit=async e=>{
+    e.preventDefault();const error=$('#edit-reservation-error');error.textContent='';
+    const lines=[...draft].filter(([,quantity])=>quantity>0).map(([id,quantity])=>({id,quantity}));
+    if(!lines.length||lines.length>100){error.textContent='Оставьте от 1 до 100 позиций. Для полного отказа отмените резерв.';return;}
+    requestKey ||= crypto.randomUUID();
+    const input={requestKey,expectedRevision:reservation.revision||1,lines,comment:$('#edit-reservation-comment').value};
+    const controls=[...form.querySelectorAll('input,select,textarea,button')];controls.forEach(c=>c.disabled=true);
+    try{
+      await api('/reservations/'+reservation.id,'PATCH',input);closeDialog();toast('Резерв изменён. Остатки пересчитаны.');renderReservations(all);
+    }catch(e){error.textContent=e.message;controls.forEach(c=>c.disabled=false);if(e.status===409)form.querySelector('#reload-reservations').hidden=false;}
+  };
+}
 function changeReservation(id,status,all){
+  const expectedRevision=state.reservations.find(r=>r.id===id)?.revision||1;
   showDialog(status==='cancelled'?'Отменить резерв?':'Подтвердить резерв?',`<p class="status-message">${status==='cancelled'?'Товары вернутся в свободный остаток.':'Товары останутся закреплены за клиентом.'}</p><button class="primary full" id="confirm-action">${status==='cancelled'?'Да, отменить':'Подтвердить'}</button>`);
-  $('#confirm-action').onclick=async()=>{const b=$('#confirm-action');b.disabled=true;try{await api('/reservations/'+id,'PATCH',{status});closeDialog();state.shipments=(await api('/catalog')).shipments;renderReservations(all);}catch(e){b.disabled=false;toast(e.message);}};
+  $('#confirm-action').onclick=async()=>{const b=$('#confirm-action');b.disabled=true;try{await api('/reservations/'+id,'PATCH',{status,expectedRevision});closeDialog();state.shipments=(await api('/catalog')).shipments;renderReservations(all);}catch(e){b.disabled=false;toast(e.message);}};
 }
 function renderAdmin(){
   if(!state.admin){state.view='shipments';render();return;}

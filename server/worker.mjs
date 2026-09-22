@@ -12,7 +12,7 @@ async function readJson(request) {
 async function telegram(env,method,body) {
   const response=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(15000)});
   const result=await response.json();
-  if(!response.ok || !result.ok) throw new Error('Telegram request failed');
+  if(!response.ok || !result.ok) { const error=new Error('Telegram request failed');error.telegramCode=result.error_code;error.telegramDescription=result.description||'';throw error; }
   return result.result;
 }
 
@@ -20,6 +20,7 @@ export class ReserveStore {
   constructor(ctx,env) {
     this.ctx=ctx; this.env=env;
     this.inventory=new Inventory(ctx.storage.sql,fn=>ctx.storage.transactionSync(fn));
+    this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS reservation_messages (reservation_id TEXT NOT NULL, target TEXT NOT NULL, part INTEGER NOT NULL, message_id INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY(reservation_id,target,part))');
     this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS bot_updates (id INTEGER PRIMARY KEY)');
     this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
   }
@@ -54,7 +55,9 @@ export class ReserveStore {
       if(/^\/api\/reservations\/[a-f0-9-]+$/.test(path) && request.method==='PATCH') {
         const input=await readJson(request);
         await this.ensureAlarm();
-        const reservation=this.inventory.changeReservation(user,path.split('/').pop(),input.status,admin);
+        const id=path.split('/').pop();
+        if('lines' in input && 'status' in input) throw new ApiError(400,'Изменяйте состав и статус отдельными действиями.');
+        const reservation='lines' in input?this.inventory.editReservation(user,id,input,admin):this.inventory.changeReservation(user,id,input.status,admin,input.expectedRevision);
         this.ctx.waitUntil(this.flush());
         return json({reservation});
       }
@@ -97,9 +100,10 @@ export class ReserveStore {
     this.flushing=true;
     try {
       if(!this.env.RESERVATION_CHAT_ID || !this.env.BOT_TOKEN) return;
+      const budget={remaining:20};
       for(const row of this.inventory.rows('SELECT id,data FROM outbox WHERE sent=0 ORDER BY rowid LIMIT 20')) {
-        const data=JSON.parse(row.data);
-        await telegram(this.env,'sendMessage',{chat_id:this.env.RESERVATION_CHAT_ID,text:data.text});
+        const data=JSON.parse(row.data),id=data.reservationId||row.id.split(':')[0];
+        if(!await this.syncReservationMessage(id,budget))break;
         this.inventory.sql.exec('UPDATE outbox SET sent=1 WHERE id=?',row.id);
       }
     } catch { console.warn('Notification pending; scheduled retry'); }
@@ -107,6 +111,41 @@ export class ReserveStore {
       this.flushing=false;
       if(this.inventory.one('SELECT id FROM outbox WHERE sent=0 LIMIT 1')) await this.ensureAlarm();
     }
+  }
+  async syncReservationMessage(id,budget) {
+    const row=this.inventory.one('SELECT data,status FROM reservations WHERE id=?',id);
+    if(!row)throw new Error('Reservation notification missing');
+    const data={...JSON.parse(row.data),status:row.status},target=String(this.env.RESERVATION_CHAT_ID);
+    const text=this.inventory.notificationText(data),chunks=[];
+    let chunk='';for(const char of text){if(chunk.length+char.length>3000){chunks.push(chunk);chunk='';}chunk+=char;}if(chunk)chunks.push(chunk);
+    const previous=this.inventory.rows('SELECT * FROM reservation_messages WHERE reservation_id=? AND target=? ORDER BY part',id,target);
+    // Old extra parts are cleared in place and can be reused if the reservation grows later.
+    const count=Math.max(chunks.length,previous.length);
+    for(let part=0;part<count;part++) {
+      const content=chunks[part]||`Резерв №${id} · Эта часть больше не используется. Актуальный состав — в первом сообщении.`,old=previous.find(p=>p.part===part);
+      if(old?.text===content)continue;
+      if(budget.remaining<=0)return false;
+      let messageId=old?.message_id;
+      if(messageId){
+        budget.remaining--;
+        try{await telegram(this.env,'editMessageText',{chat_id:target,message_id:messageId,text:content});}
+        catch(error){
+          const description=error.telegramDescription||'';
+          if(error.telegramCode===400 && /message is not modified/i.test(description)) { /* A previous edit succeeded before a lost response. */ }
+          else if(error.telegramCode===400 && /message to edit not found|message can't be edited|message can not be edited/i.test(description))messageId=null;
+          else throw error;
+        }
+      }
+      if(!messageId){
+        if(budget.remaining<=0)return false;
+        budget.remaining--;
+        const sent=await telegram(this.env,'sendMessage',{chat_id:target,text:content});
+        if(!Number.isSafeInteger(sent?.message_id) || sent.message_id<=0)throw new Error('Telegram message ID missing');
+        messageId=sent.message_id;
+      }
+      this.inventory.sql.exec('INSERT INTO reservation_messages(reservation_id,target,part,message_id,text) VALUES(?,?,?,?,?) ON CONFLICT(reservation_id,target,part) DO UPDATE SET message_id=excluded.message_id,text=excluded.text',id,target,part,messageId,content);
+    }
+    return true;
   }
   async alarm() {
     // Re-arm before external I/O. A crash cannot strand a committed notification.

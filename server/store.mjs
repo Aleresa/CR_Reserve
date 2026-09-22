@@ -13,9 +13,27 @@ export class Inventory {
     sql.exec(`CREATE TABLE IF NOT EXISTS products (shipment TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, total INTEGER NOT NULL CHECK(total>=0), reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved>=0 AND reserved<=total), PRIMARY KEY(shipment,id))`);
     sql.exec(`CREATE TABLE IF NOT EXISTS reservations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, shipment TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(user_id,request_key))`);
     sql.exec(`CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, data TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0)`);
+    sql.exec('CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
   }
   rows(query,...bindings) { return [...this.sql.exec(query,...bindings)]; }
   one(query,...bindings) { return this.rows(query,...bindings)[0]; }
+  managers() { return this.rows('SELECT data FROM managers ORDER BY rowid').map(r=>JSON.parse(r.data)); }
+  saveManagers(input) {
+    if(!Array.isArray(input.managers) || input.managers.length>100) throw new ApiError(400,'Допустимо не больше 100 менеджеров.');
+    const ids=new Set(),usernames=new Set();
+    const managers=input.managers.map(m=>{
+      if(!m || typeof m!=='object') throw new ApiError(400,'Проверьте список менеджеров.');
+      const name=trim(m.name,80),username=trim(m.username,80).replace(/^@/,'');
+      if(!validId(m.id) || ids.has(m.id) || !name || /[\r\n]/.test(name) || !/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(username) || usernames.has(username.toLowerCase())) throw new ApiError(400,'Укажите имя и уникальный Telegram-ник менеджера, например @manager_name.');
+      ids.add(m.id);usernames.add(username.toLowerCase());
+      return {id:m.id,name,username};
+    });
+    return this.transaction(()=>{
+      this.sql.exec('DELETE FROM managers');
+      for(const m of managers)this.sql.exec('INSERT INTO managers(id,data) VALUES(?,?)',m.id,JSON.stringify(m));
+      return managers;
+    });
+  }
   catalog(admin=false) {
     return this.rows('SELECT data FROM shipments').map(r=>JSON.parse(r.data)).filter(s=>admin || s.status !== 'draft').map(s=>({...s,products:this.rows('SELECT * FROM products WHERE shipment=?',s.id).map(p=>({...JSON.parse(p.data),stock:p.total-p.reserved,...(admin?{total:p.total,reserved:p.reserved}:{})}))}));
   }
@@ -56,13 +74,17 @@ export class Inventory {
       seen.add(l.id); return {id:l.id,quantity:l.quantity};
     }).sort((a,b)=>a.id.localeCompare(b.id));
     const comment=trim(input.comment,1000);
-    const fingerprint=JSON.stringify({shipment:input.shipmentId,lines,comment});
+    if(input.managerId!==undefined && !validId(input.managerId)) throw new ApiError(400,'Выберите менеджера.');
+    // Keep the old fingerprint shape for retries of reservations made before manager selection existed.
+    const fingerprint=JSON.stringify({shipment:input.shipmentId,lines,comment,...(input.managerId?{managerId:input.managerId}:{})});
     return this.transaction(()=>{
       const previous=this.one('SELECT * FROM reservations WHERE user_id=? AND request_key=?',user.id,input.requestKey);
       if(previous) {
         if(previous.fingerprint!==fingerprint) throw new ApiError(409,'Повтор запроса с другим содержимым.');
         return {...JSON.parse(previous.data),status:previous.status,repeated:true};
       }
+      const manager=this.managers().find(m=>m.id===input.managerId);
+      if(!manager) throw new ApiError(400,'Выберите менеджера из актуального списка. Если список пуст, обратитесь в магазин.');
       const shipmentRow=this.one('SELECT data FROM shipments WHERE id=?',input.shipmentId);
       const shipment=shipmentRow && JSON.parse(shipmentRow.data);
       if(!shipment || !ACTIVE.has(shipment.status)) throw new ApiError(409,'Резерв этой поставки закрыт.');
@@ -73,7 +95,7 @@ export class Inventory {
         if(row.total-row.reserved<l.quantity) throw new ApiError(409,`${product.sku}: свободно ${row.total-row.reserved} шт. Обновите количество.`);
         return {id:l.id,sku:product.sku,name:product.name,quantity:l.quantity,price:product.price};
       });
-      const data={id:crypto.randomUUID(),shipmentId:shipment.id,shipmentTitle:shipment.title,user,lines:detailed,comment,status:'reserved',createdAt:new Date().toISOString(),total:detailed.reduce((s,l)=>s+l.price*l.quantity,0)};
+      const data={id:crypto.randomUUID(),shipmentId:shipment.id,shipmentTitle:shipment.title,user,manager,lines:detailed,comment,status:'reserved',createdAt:new Date().toISOString(),total:detailed.reduce((s,l)=>s+l.price*l.quantity,0)};
       if(!Number.isSafeInteger(data.total)) throw new ApiError(400,'Слишком большая сумма.');
       for(const l of detailed) this.sql.exec('UPDATE products SET reserved=reserved+? WHERE shipment=? AND id=?',l.quantity,shipment.id,l.id);
       this.sql.exec('INSERT INTO reservations(id,user_id,request_key,fingerprint,shipment,status,data) VALUES(?,?,?,?,?,?,?)',data.id,user.id,input.requestKey,fingerprint,shipment.id,data.status,JSON.stringify(data));
@@ -102,7 +124,7 @@ export class Inventory {
   enqueue(data,event) {
     const name={created:'Новый резерв',cancelled:'Резерв отменён',confirmed:'Резерв подтверждён'}[event];
     const who=`${data.user.name}${data.user.username?' @'+data.user.username:''} (ID ${data.user.id})`;
-    const text=`${name} №${data.id}\nКлиент: ${who}\nПоставка: ${data.shipmentTitle}\n\n${data.lines.map(l=>`${l.sku} · ${l.name}\n${l.quantity} шт. × ${(l.price/100).toFixed(2)} ₽`).join('\n\n')}\n\nИтого: ${(data.total/100).toFixed(2)} ₽${data.comment?'\nКомментарий: '+data.comment:''}`;
+    const text=`${name} №${data.id}${data.manager?'\nМенеджер: '+data.manager.name+' @'+data.manager.username:''}\nКлиент: ${who}\nПоставка: ${data.shipmentTitle}\n\n${data.lines.map(l=>`${l.sku} · ${l.name}\n${l.quantity} шт. × ${(l.price/100).toFixed(2)} ₽`).join('\n\n')}\n\nИтого: ${(data.total/100).toFixed(2)} ₽${data.comment?'\nКомментарий: '+data.comment:''}`;
     const chunks=[];
     for(let i=0;i<text.length;i+=3000) chunks.push(text.slice(i,i+3000));
     chunks.forEach((text,index)=>this.sql.exec('INSERT OR IGNORE INTO outbox(id,data) VALUES(?,?)',`${data.id}:${event}:${index}`,JSON.stringify({text,kind:'manager'})));

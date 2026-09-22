@@ -26,7 +26,7 @@ async function init(){
     if(state.preview){state.shipments=(await (await fetch('./data/catalog.json')).json()).shipments;notice('Предпросмотр: условные товары для проверки интерфейса. Отправка резервов отключена.');}
     else{
       if(!tg?.initData){app.innerHTML=`<div class="empty"><strong>Откройте приложение в Telegram</strong>Ваши резервы привязаны к Telegram-аккаунту.<p><a class="primary" href="https://t.me/CR_Reserve_Bot/CR_Reserve">Открыть CR Reserve</a></p></div>`;return;}
-      const me=await api('/me');state.admin=me.admin;
+      const me=await api('/me');state.admin=me.admin;state.user=me.user;
       state.shipments=(await api('/catalog')).shipments;
       $('#admin-tab').hidden=!state.admin;
       notice(state.ready?'':'Приём резервов откроется после подключения рабочего канала.');
@@ -135,6 +135,7 @@ function showCart(){
 }
 async function renderReservations(all=false){
   app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>${all?'Все резервы':'Мои резервы'}</h1></div>${all?'<button class="secondary" id="export">Excel ↓</button>':''}</div><div id="reservations"><p class="empty">Загружаем…</p></div>`;
+  if(!all && !state.preview && state.user)$('#reservations').insertAdjacentHTML('beforebegin',`<p class="muted">Ваш Telegram ID: <strong id="telegram-user-id">${esc(state.user.id)}</strong></p>`);
   if(state.preview){$('#reservations').innerHTML='<div class="empty"><strong>Здесь будут ваши резервы</strong>Отправка появится после подключения бота и рабочего канала.</div>';return;}
   try{
     const {reservations}=await api('/reservations'+(all?'?all=1':''));state.reservations=reservations;

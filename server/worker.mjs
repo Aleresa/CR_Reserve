@@ -21,6 +21,7 @@ export class ReserveStore {
     this.ctx=ctx; this.env=env;
     this.inventory=new Inventory(ctx.storage.sql,fn=>ctx.storage.transactionSync(fn));
     this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS bot_updates (id INTEGER PRIMARY KEY)');
+    this.inventory.sql.exec('CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
   }
   async fetch(request) {
     try {
@@ -30,6 +31,11 @@ export class ReserveStore {
       const user=await authenticate(request.headers.get('X-Telegram-Init-Data'),this.env.BOT_TOKEN);
       const admin=isAdmin(user,this.env);
       if(path==='/api/me' && request.method==='GET') return json({user,admin});
+      if(path==='/api/admin/setup-bot' && request.method==='POST') {
+        if(!admin) throw new ApiError(403,'Раздел доступен только владельцу.');
+        await readJson(request);
+        return json(await this.setupBot(url.origin));
+      }
       if(path==='/api/catalog' && request.method==='GET') return json({shipments:this.inventory.catalog(admin)});
       if(path==='/api/reservations' && request.method==='GET') return json({reservations:this.inventory.reservations(user,admin && url.searchParams.get('all')==='1')});
       if(path==='/api/reservations' && request.method==='POST') {
@@ -57,6 +63,29 @@ export class ReserveStore {
       return json({error:error instanceof ApiError?error.message:'Не удалось выполнить запрос. Попробуйте ещё раз.'},error.status || 500);
     }
   }
+  webhookSecret() {
+    return this.env.WEBHOOK_SECRET || this.inventory.one("SELECT value FROM bot_settings WHERE key='webhook_secret'")?.value;
+  }
+  async setupBot(origin) {
+    if(!origin.startsWith('https://')) throw new ApiError(400,'Для подключения нужен HTTPS-адрес приложения.');
+    if(!this.webhookSecret()) {
+      const secret=Array.from(crypto.getRandomValues(new Uint8Array(32)),b=>b.toString(16).padStart(2,'0')).join('');
+      // Persist before registering with Telegram; repeated clicks and restarts reuse it.
+      this.inventory.sql.exec("INSERT OR IGNORE INTO bot_settings(key,value) VALUES('webhook_secret',?)",secret);
+    }
+    const secret=this.webhookSecret();
+    if(!/^[A-Za-z0-9_-]{16,256}$/.test(secret)) throw new ApiError(400,'Проверьте WEBHOOK_SECRET: от 16 до 256 латинских букв, цифр, дефисов или подчёркиваний.');
+    try {
+      await Promise.all([
+        telegram(this.env,'setWebhook',{url:origin+'/telegram/webhook',secret_token:secret,allowed_updates:['message']}),
+        telegram(this.env,'setChatMenuButton',{menu_button:{type:'web_app',text:'Поставки',web_app:{url:origin}}}),
+        telegram(this.env,'setMyCommands',{commands:[{command:'start',description:'Открыть поставки'},{command:'id',description:'Узнать свой Telegram ID'},{command:'admin',description:'Управление поставками'}]})
+      ]);
+    } catch {
+      throw new ApiError(502,'Не удалось завершить настройку бота. Повторите подключение; если ошибка сохранится, проверьте BOT_TOKEN в Cloudflare.');
+    }
+    return {ok:true};
+  }
   async ensureAlarm() { if(!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now()+30000); }
   async flush() {
     if(this.flushing) return;
@@ -81,7 +110,8 @@ export class ReserveStore {
     if(!this.inventory.one('SELECT id FROM outbox WHERE sent=0 LIMIT 1')) await this.ctx.storage.deleteAlarm();
   }
   async webhook(request) {
-    if(request.method!=='POST' || !this.env.WEBHOOK_SECRET || request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==this.env.WEBHOOK_SECRET) return json({error:'Forbidden'},403);
+    const secret=this.webhookSecret();
+    if(request.method!=='POST' || !secret || request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==secret) return json({error:'Forbidden'},403);
     const update=await readJson(request);
     if(!Number.isSafeInteger(update.update_id)) return json({error:'Invalid update'},400);
     if(this.inventory.one('SELECT id FROM bot_updates WHERE id=?',update.update_id)) return json({ok:true});

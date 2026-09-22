@@ -152,9 +152,20 @@ function changeReservation(id,status,all){
 }
 function renderAdmin(){
   if(!state.admin){state.view='shipments';render();return;}
-  app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>Управление</h1></div><button class="primary" id="new-shipment">+ Поставка</button></div><div class="actions"><button class="secondary" id="all-reservations">Все резервы</button></div><section class="admin-panel">${state.shipments.length?state.shipments.map(s=>`<div class="admin-row"><div><strong>${esc(s.title)}</strong><small>${s.products.length} позиций · ${date(s.eta)}</small>${badge(s.status)}</div><button class="secondary" data-edit="${esc(s.id)}">Изменить</button></div>`).join(''):'<p class="muted">Загрузите Excel, проверьте товары и опубликуйте поставку.</p>'}</section>`;
+  app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>Управление</h1></div><button class="primary" id="new-shipment">+ Поставка</button></div><div class="actions"><button class="secondary" id="all-reservations">Все резервы</button><button class="secondary" id="setup-bot">Подключить бота</button></div><section class="admin-panel">${state.shipments.length?state.shipments.map(s=>`<div class="admin-row"><div><strong>${esc(s.title)}</strong><small>${s.products.length} позиций · ${date(s.eta)}</small>${badge(s.status)}</div><button class="secondary" data-edit="${esc(s.id)}">Изменить</button></div>`).join(''):'<p class="muted">Загрузите Excel, проверьте товары и опубликуйте поставку.</p>'}</section>`;
   $('#new-shipment').onclick=()=>editShipment();$('#all-reservations').onclick=()=>renderReservations(true);
+  $('#setup-bot').onclick=showBotSetup;
   document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editShipment(state.shipments.find(s=>s.id===b.dataset.edit)));
+}
+function showBotSetup(){
+  showDialog('Подключение бота',`<p>Подключим команды бота и кнопку открытия поставок.</p><p>Затем добавьте @CR_Reserve_Bot администратором рабочего канала с правом публикации и перешлите ему сообщение из этого канала. Бот ответит ID канала для настройки уведомлений.</p><p id="bot-setup-error" class="error" role="alert"></p><button class="primary full" id="connect-bot">Подключить</button>`);
+  $('#connect-bot').onclick=async()=>{
+    const button=$('#connect-bot'),error=$('#bot-setup-error');button.disabled=true;button.textContent='Подключаем…';error.textContent='';
+    try{
+      await api('/admin/setup-bot','POST',{});
+      showDialog('Бот подключён',`<p>Добавьте @CR_Reserve_Bot администратором рабочего канала с правом публикации сообщений.</p><p>Перешлите сообщение из канала в личный чат с ботом, сохранив источник пересылки. Полученный ID укажите в Cloudflare как Secret <strong>RESERVATION_CHAT_ID</strong>, сохраните и переоткройте приложение.</p><p><a class="primary" href="https://t.me/CR_Reserve_Bot" target="_blank" rel="noopener">Открыть бота</a></p>`);
+    }catch(e){error.textContent=e.message;button.disabled=false;button.textContent='Повторить подключение';}
+  };
 }
 function editShipment(existing){
   let products=existing?.products.map(p=>({...p,total:p.total??p.stock})),warnings=[];

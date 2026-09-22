@@ -82,3 +82,39 @@ test('worker rejects missing identity/admin rights, accepts signed client, and b
   assert.equal((await store.fetch(new Request('https://app/api/reservations',{method:'POST',headers,body:JSON.stringify(request('key'))}))).status,503);
   assert.equal((await store.fetch(new Request('https://app/telegram/webhook',{method:'POST',headers,body:'{}'}))).status,403);
 });
+
+test('only the owner can configure bot; webhook secret survives restart and never reaches client',async t=>{
+  const {sql,txn}=fixture(),token='test:setup',env={BOT_TOKEN:token,ADMIN_IDS:'123'};
+  const ctx={storage:{sql,transactionSync:txn},waitUntil:()=>{}};
+  const store=new ReserveStore(ctx,env),calls=[];
+  t.mock.method(globalThis,'fetch',async(url,options)=>{
+    calls.push({method:new URL(url).pathname.split('/').pop(),body:JSON.parse(options.body)});
+    return Response.json({ok:true,result:true});
+  });
+  const configure=(data=signedData(token))=>new Request('https://app.example/api/admin/setup-bot',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Init-Data':data},body:'{}'});
+  assert.equal((await store.fetch(configure(''))).status,401);
+  assert.equal((await store.fetch(configure(signedData(token,{user:JSON.stringify({id:456,first_name:'Buyer'})})))).status,403);
+  assert.equal(calls.length,0);assert.equal(store.webhookSecret(),undefined);
+  const result=await store.fetch(configure());assert.equal(result.status,200);assert.deepEqual(await result.json(),{ok:true});
+  const secret=store.webhookSecret();assert.match(secret,/^[a-f0-9]{64}$/);
+  assert.deepEqual(calls.map(c=>c.method).sort(),['setChatMenuButton','setMyCommands','setWebhook'].sort());
+  assert.equal(calls.find(c=>c.method==='setWebhook').body.url,'https://app.example/telegram/webhook');
+  assert.equal(calls.find(c=>c.method==='setWebhook').body.secret_token,secret);
+  const restarted=new ReserveStore(ctx,env);assert.equal(restarted.webhookSecret(),secret);
+  assert.equal((await restarted.fetch(configure())).status,200);assert.equal(restarted.webhookSecret(),secret);
+  const webhook=value=>new Request('https://app.example/telegram/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Bot-Api-Secret-Token':value},body:JSON.stringify({update_id:100})});
+  assert.equal((await restarted.fetch(webhook('wrong'))).status,403);
+  assert.equal((await restarted.fetch(webhook(secret))).status,200);
+  const overridden=new ReserveStore(ctx,{...env,WEBHOOK_SECRET:'explicit-secret-123456789'});
+  assert.equal((await overridden.fetch(webhook(secret))).status,403);
+  assert.equal((await overridden.fetch(webhook('explicit-secret-123456789'))).status,200);
+});
+
+test('bot setup reports Telegram failures without exposing token or secret',async t=>{
+  const {sql,txn}=fixture(),token='test:secret-token';
+  const store=new ReserveStore({storage:{sql,transactionSync:txn}},{BOT_TOKEN:token,ADMIN_IDS:'123'});
+  t.mock.method(globalThis,'fetch',async()=>Response.json({ok:false},{status:401}));
+  const response=await store.fetch(new Request('https://app.example/api/admin/setup-bot',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Init-Data':signedData(token)},body:'{}'}));
+  assert.equal(response.status,502);const body=await response.text();
+  assert(!body.includes(token));assert(!body.includes(store.webhookSecret()));
+});

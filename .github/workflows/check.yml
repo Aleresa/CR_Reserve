@@ -9,7 +9,7 @@ jobs:
         with:
           node-version: '24'
       - run: npm test
-      - run: node --check public/app.js && node --check public/xlsx.js && node --check server/worker.mjs
+      - run: node --check public/app.js && node --check public/xlsx.js && node --check server/worker.mjs && node --check public/xls-worker.js && node --check public/xls-images.js && node --check public/supplier-rows.js
       - run: npm install --no-save --package-lock=false playwright@1.58.2 jszip@3.10.1
       - run: npx playwright install --with-deps chromium
       - run: node tests/browser.mjs

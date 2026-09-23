@@ -61,6 +61,10 @@ export class ReserveStore {
         this.ctx.waitUntil(this.flush());
         return json({reservation});
       }
+      if(/^\/api\/admin\/shipments\/[a-zA-Z0-9_-]{1,80}$/.test(path) && request.method==='DELETE') {
+        if(!admin)throw new ApiError(403,'Раздел доступен только владельцу.');
+        return json(this.inventory.deleteShipment(path.split('/').pop()));
+      }
       if(path==='/api/admin/shipments' && request.method==='POST') {
         if(!admin) throw new ApiError(403,'Раздел доступен только владельцу.');
         return json({shipment:this.inventory.importShipment(await readJson(request))});

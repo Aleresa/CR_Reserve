@@ -4,3 +4,5 @@
 @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
 
 .manager-editor{padding:0 0 18px;margin-bottom:18px;border-bottom:1px solid var(--line)}
+
+.shipment-actions{display:flex;flex-direction:column;gap:8px;flex-shrink:0}.admin-row>div:first-child{min-width:0;overflow-wrap:anywhere}.import-preview input[data-import-price]{min-width:110px;width:120px}

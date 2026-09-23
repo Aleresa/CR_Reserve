@@ -7,6 +7,7 @@ import {readFile,mkdir} from 'node:fs/promises';
 import {resolve,extname,sep} from 'node:path';
 import http from 'node:http';
 import assert from 'node:assert/strict';
+import {legacyFixture} from './excel-fixtures.mjs';
 import {ReserveStore} from '../server/worker.mjs';
 
 const token='local-test-only',db=new DatabaseSync(':memory:');
@@ -45,6 +46,10 @@ try{
   await page.route('https://telegram.org/js/telegram-web-app.js',route=>route.fulfill({contentType:'text/javascript',body:`window.Telegram={WebApp:{initData:${JSON.stringify(initData)},ready(){},expand(){},BackButton:{show(){},hide(){},onClick(){}}}};`}));
   await page.goto('http://localhost:4174');await page.waitForSelector('.shipment-card');
   assert.equal(await page.locator('.shipment-card').count(),1);
+  await page.locator('#shipment-search').fill('Demo');
+  await page.locator('#refresh').click();await page.waitForFunction(()=>!document.querySelector('#refresh').disabled);
+  assert.equal(await page.locator('#shipment-search').inputValue(),'Demo');
+  await page.locator('#shipment-search').fill('');await page.waitForSelector('.shipment-card');
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   await page.screenshot({path:'test-results/mobile.png',fullPage:true});
   await page.locator('#admin-tab').click();await page.locator('#managers').click();
@@ -76,7 +81,7 @@ try{
   await page.locator(`[data-edit-qty="${firstProduct.id}"]`).fill('0');await page.locator(`[data-edit-qty="${secondProduct.id}"]`).fill('1');
   await page.locator('#save-reservation').click();await page.waitForSelector('#edit-reservation-form',{state:'hidden'});await page.waitForSelector('[data-cancel]');
   assert.deepEqual(store.inventory.catalog()[0].products.map(p=>p.stock),[10,4]);
-  await page.locator('[data-cancel]').click();await page.locator('#confirm-action').click();await page.waitForSelector('.badge.cancelled');
+  await page.locator('[data-cancel]').click();await page.locator('#confirm-action').click();await page.waitForSelector('#reservations .empty strong');assert.equal(await page.locator('.reservation').count(),0);
   assert.deepEqual(store.inventory.catalog()[0].products.map(p=>p.stock),[10,5]);
   await page.locator('#admin-tab').click();await page.locator('#new-shipment').click();
   // A minimal XLSX with inline strings verifies the same import UI used for supplier files.
@@ -88,7 +93,21 @@ try{
   await page.locator('#xlsx-file').setInputFiles({name:'Test.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:await z.generateAsync({type:'nodebuffer'})});
   await page.waitForSelector('#accept-warnings');await page.locator('#accept-warnings').check();await page.locator('#save-shipment').click();
   await page.waitForSelector('.admin-row:nth-child(2)');assert.equal(store.inventory.catalog(true).length,2);
-  await page.locator('#all-reservations').click();
+  // Binary XLS goes through the worker. Empty prices must be filled before Save.
+  await page.locator('#new-shipment').click();
+  await page.locator('#xlsx-file').setInputFiles({name:'Legacy.xls',mimeType:'application/vnd.ms-excel',buffer:legacyFixture()});
+  await page.waitForSelector('[data-import-price="xls-1"]');
+  await page.locator('#accept-warnings').check();await page.locator('#save-shipment').click();
+  assert.equal(store.inventory.catalog(true).length,2);
+  await page.locator('[data-import-price="xls-1"]').fill('199.90');await page.locator('#save-shipment').click();
+  await page.waitForSelector('.admin-row:nth-child(3)');
+  const legacy=store.inventory.catalog(true).find(s=>s.title==='Legacy');assert.equal(legacy.products[0].price,19990);
+  await page.locator(`[data-delete-shipment="${legacy.id}"]`).click();await page.locator('#delete-shipment').click();
+  await page.waitForSelector('.admin-row:nth-child(3)',{state:'detached'});
+  assert.equal(store.inventory.catalog(true).length,2);
+  await page.locator('#all-reservations').click();await page.waitForSelector('.badge.cancelled');
+  await page.locator('#refresh').click();await page.waitForSelector('.badge.cancelled');
+  assert.equal(await page.locator('h1').textContent(),'Все резервы');
   const downloadPromise=page.waitForEvent('download');await page.locator('#export').click();const download=await downloadPromise;await download.saveAs('test-results/reservations.xlsx');
   const exported=await JSZip.loadAsync(await readFile('test-results/reservations.xlsx'));assert(exported.file('xl/worksheets/sheet1.xml'));assert.match(await exported.file('xl/worksheets/sheet1.xml').async('text'),/@ivan_test/);
   await page.setViewportSize({width:1440,height:1000});await page.locator('[data-view="shipments"]').click();

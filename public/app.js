@@ -1,13 +1,16 @@
-import {readSupplierXlsx,exportReservations} from './xlsx.js';
+import {readSupplierExcel,exportReservations} from './xlsx.js';
 
 const $=s=>document.querySelector(s), app=$('#app'), dialog=$('#dialog');
 const tg=window.Telegram?.WebApp;
 const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
-const money=n=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:n%100?2:0}).format(n/100);
+const moneyFormats=[0,2].map(maximumFractionDigits=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits}));
+const money=n=>moneyFormats[n%100?1:0].format(n/100);
 const date=s=>s?new Date(s.length===10?s+'T12:00:00':s).toLocaleDateString('ru-RU',{day:'numeric',month:'long'}):'Дата уточняется';
 const statuses={draft:'Черновик',in_transit:'В пути',arrived:'Прибыло',closed:'Резерв закрыт',reserved:'Зарезервировано',confirmed:'Подтверждено',cancelled:'Отменено'};
 const state={preview:false,admin:false,ready:false,view:'shipments',shipments:[],current:null,filter:'all',sort:'new',search:'',cart:{},images:{},reservations:[],requestKey:null,managers:[],managerId:null};
-let toastTimer;
+let toastTimer,refreshPromise,importController;
+const imageRequests=new Map();
+const debounce=(fn,delay=120)=>{let timer;return (...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay);};};
 function toast(message){$('#toast').textContent=message;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,6500);}
 function badge(status){return `<span class="badge ${esc(status)}">${esc(statuses[status]||status)}</span>`;}
 function notice(text){$('#notice').textContent=text;$('#notice').hidden=!text;}
@@ -38,8 +41,8 @@ async function loadImages(shipment){
   const keys=[...new Set(shipment.products.filter(p=>p.imageKey).map(p=>p.imageKey.split('/')[0]))];
   for(const key of keys){
     if(state.images[key])continue;
-    try{state.images[key]=await (await fetch(`./data/${encodeURIComponent(key)}-images.json`)).json();}
-    catch{state.images[key]={};}
+    if(!imageRequests.has(key))imageRequests.set(key,fetch(`./data/${encodeURIComponent(key)}-images.json`).then(r=>r.json()).then(images=>state.images[key]=images).catch(()=>state.images[key]={}).finally(()=>imageRequests.delete(key)));
+    await imageRequests.get(key);
   }
   hydrateImages();
 }
@@ -52,9 +55,10 @@ function hydrateImages(){document.querySelectorAll('img[data-image]').forEach(el
 function activeShipment(){return state.shipments.find(s=>s.id===state.current);}
 function isOpen(s){return ['in_transit','arrived'].includes(s.status);}
 function render(){
-  document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===state.view));
+  document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===(state.view==='all-reservations'?'admin':state.view)));
   if(state.view==='shipments')state.current?renderDetail():renderShipments();
   else if(state.view==='reservations')renderReservations();
+  else if(state.view==='all-reservations')renderReservations(true);
   else if(state.view==='admin')renderAdmin();
   cartBar();
   if(tg?.BackButton){if(state.current){tg.BackButton.show();}else{tg.BackButton.hide();}}
@@ -64,7 +68,8 @@ function renderShipments(){
   <div class="toolbar"><input class="search" id="shipment-search" type="search" placeholder="Найти поставку или бренд" aria-label="Поиск поставки" value="${esc(state.search)}"><select id="sort" aria-label="Сортировка"><option value="new">Сначала новые</option><option value="eta">По дате поступления</option><option value="old">Сначала старые</option></select></div>
   <div class="chips">${[['all','Все поставки'],['in_transit','В пути'],['arrived','Прибыло'],['closed','Закрытые']].map(([id,label])=>`<button class="chip ${state.filter===id?'active':''}" data-filter="${id}">${label}</button>`).join('')}</div><div class="shipment-grid" id="shipment-grid"></div>`;
   $('#sort').value=state.sort;
-  $('#shipment-search').oninput=e=>{state.search=e.target.value;cards();};
+  const updateCards=debounce(()=>{if($('#shipment-grid'))cards();});
+  $('#shipment-search').oninput=e=>{state.search=e.target.value;updateCards();};
   $('#sort').onchange=e=>{state.sort=e.target.value;cards();};
   document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{state.filter=b.dataset.filter;document.querySelectorAll('[data-filter]').forEach(c=>c.classList.toggle('active',c===b));cards();});
   cards();
@@ -86,7 +91,7 @@ function openShipment(id){if(state.current!==id){state.cart={};state.requestKey=
 function renderDetail(){
   const s=activeShipment();if(!s){state.current=null;render();return;}
   app.innerHTML=`<button class="back" id="back">← Все поставки</button><section class="detail-head">${badge(s.status)}<h1>${esc(s.title)}</h1>${s.description?`<p class="subtitle">${esc(s.description).replaceAll('\n','<br>')}</p>`:''}<div class="detail-meta"><span>Поступление<strong>${date(s.eta)}</strong></span><span>В поставке<strong>${s.products.length} позиций</strong></span></div></section><div class="toolbar"><input class="search" type="search" id="product-search" placeholder="Название, модель или артикул" aria-label="Поиск товара"></div><div class="products" id="products"></div>`;
-  $('#back').onclick=goBack;$('#product-search').oninput=e=>products(e.target.value);products('');loadImages(s);
+  $('#back').onclick=goBack;$('#product-search').oninput=debounce(e=>{if(e.target.isConnected)products(e.target.value);});products('');loadImages(s);
 }
 function products(query){
   const s=activeShipment(),list=s.products.filter(p=>`${p.name} ${p.sku}`.toLowerCase().includes(query.toLowerCase()));
@@ -111,7 +116,7 @@ function cartBar(){
   $('#cart-bar').hidden=!visible;document.body.classList.toggle('has-cart',visible);
   if(visible){$('#cart-bar').innerHTML=`<button id="open-cart"><span>В резерве: ${t.count} шт.<br><small>Проверить и отправить</small></span><strong>${money(t.total)} →</strong></button>`;$('#open-cart').onclick=showCart;}
 }
-function closeDialog(){dialog.close();}
+function closeDialog(){importController?.abort();dialog.close();}
 function showDialog(title,body){dialog.innerHTML=`<div class="dialog-header"><h2>${esc(title)}</h2><button class="icon-button" id="close-dialog" aria-label="Закрыть">×</button></div>${body}`;$('#close-dialog').onclick=closeDialog;if(!dialog.open)dialog.showModal();}
 async function showCart(){
   try{if(!state.preview)state.managers=(await api('/managers')).managers;}catch(e){toast(e.message);return;}
@@ -138,18 +143,21 @@ async function showCart(){
   };
 }
 async function renderReservations(all=false){
+  state.view=all?'all-reservations':'reservations';
   app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>${all?'Все резервы':'Мои резервы'}</h1></div>${all?'<button class="secondary" id="export">Excel ↓</button>':''}</div><div id="reservations"><p class="empty">Загружаем…</p></div>`;
   if(!all && !state.preview && state.user)$('#reservations').insertAdjacentHTML('beforebegin',`<p class="muted">Ваш Telegram ID: <strong id="telegram-user-id">${esc(state.user.id)}</strong></p>`);
   if(state.preview){$('#reservations').innerHTML='<div class="empty"><strong>Здесь будут ваши резервы</strong>Отправка появится после подключения бота и рабочего канала.</div>';return;}
+  const container=$('#reservations');
   try{
-    const {reservations}=await api('/reservations'+(all?'?all=1':''));state.reservations=reservations;
-    if(!$('#reservations'))return;
+    const {reservations}=await api('/reservations'+(all?'?all=1':''));
+    if(!container.isConnected)return;
+    state.reservations=reservations;
     $('#reservations').innerHTML=reservations.length?reservations.map(r=>`<article class="reservation"><div class="top"><div><small>№ ${esc(r.id.slice(0,8))} · ${date(r.createdAt)}</small><h3 style="margin-top:8px">${esc(r.shipmentTitle)}</h3></div>${badge(r.status)}</div>${r.editedAt?'<p class="muted">Резерв изменён</p>':''}${all?`<p>${esc(r.user.name)} ${r.user.username?'@'+esc(r.user.username):''}</p>`:''}${r.manager?`<p class="muted">Менеджер: ${esc(r.manager.name)} · @${esc(r.manager.username)}</p>`:''}<strong>${money(r.total)}</strong><span class="muted"> · ${r.lines.reduce((s,l)=>s+l.quantity,0)} шт.</span><details><summary>Состав резерва</summary><ul>${r.lines.map(l=>`<li>${esc(l.sku)} · ${esc(l.name)} — <b>${l.quantity} шт.</b></li>`).join('')}</ul>${r.comment?`<p>${esc(r.comment)}</p>`:''}</details><div class="actions">${r.status==='reserved'||all&&r.status==='confirmed'?`<button class="secondary" data-edit-reservation="${r.id}">Изменить</button>`:''}${all&&r.status==='reserved'?`<button class="primary" data-confirm="${r.id}">Подтвердить</button>`:''}${r.status==='reserved'||all&&r.status==='confirmed'?`<button class="danger" data-cancel="${r.id}">Отменить резерв</button>`:''}</div></article>`).join(''):'<div class="empty"><strong>Резервов пока нет</strong>Выберите поставку и добавьте нужные товары.</div>';
     document.querySelectorAll('[data-edit-reservation]').forEach(b=>b.onclick=()=>editReservationForm(reservations.find(r=>r.id===b.dataset.editReservation),all));
     document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>changeReservation(b.dataset.cancel,'cancelled',all));
     document.querySelectorAll('[data-confirm]').forEach(b=>b.onclick=()=>changeReservation(b.dataset.confirm,'confirmed',all));
     if(all)$('#export').onclick=()=>exportReservations(reservations).catch(e=>toast(e.message));
-  }catch(e){if($('#reservations'))$('#reservations').innerHTML=`<p class="empty error">${esc(e.message)}</p>`;}
+  }catch(e){if(container.isConnected)container.innerHTML=`<p class="empty error">${esc(e.message)}</p>`;}
 }
 async function editReservationForm(reservation,all){
   let shipment;
@@ -192,11 +200,25 @@ function changeReservation(id,status,all){
 }
 function renderAdmin(){
   if(!state.admin){state.view='shipments';render();return;}
-  app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>Управление</h1></div><button class="primary" id="new-shipment">+ Поставка</button></div><div class="actions"><button class="secondary" id="all-reservations">Все резервы</button><button class="secondary" id="managers">Менеджеры</button><button class="secondary" id="setup-bot">Подключить бота</button></div><section class="admin-panel">${state.shipments.length?state.shipments.map(s=>`<div class="admin-row"><div><strong>${esc(s.title)}</strong><small>${s.products.length} позиций · ${date(s.eta)}</small>${badge(s.status)}</div><button class="secondary" data-edit="${esc(s.id)}">Изменить</button></div>`).join(''):'<p class="muted">Загрузите Excel, проверьте товары и опубликуйте поставку.</p>'}</section>`;
-  $('#new-shipment').onclick=()=>editShipment();$('#all-reservations').onclick=()=>renderReservations(true);
+  app.innerHTML=`<div class="page-heading"><div><p class="eyebrow">CR / RESERVE</p><h1>Управление</h1></div><button class="primary" id="new-shipment">+ Поставка</button></div><div class="actions"><button class="secondary" id="all-reservations">Все резервы</button><button class="secondary" id="managers">Менеджеры</button><button class="secondary" id="setup-bot">Подключить бота</button></div><section class="admin-panel">${state.shipments.length?state.shipments.map(s=>`<div class="admin-row"><div><strong>${esc(s.title)}</strong><small>${s.products.length} позиций · ${date(s.eta)}</small>${badge(s.status)}</div><div class="shipment-actions"><button class="secondary" data-edit="${esc(s.id)}">Изменить</button><button class="danger" data-delete-shipment="${esc(s.id)}">Удалить</button></div></div>`).join(''):'<p class="muted">Загрузите Excel, проверьте товары и опубликуйте поставку.</p>'}</section>`;
+  $('#new-shipment').onclick=()=>editShipment();$('#all-reservations').onclick=()=>{state.view='all-reservations';render();};
+  document.querySelectorAll('[data-delete-shipment]').forEach(b=>b.onclick=()=>deleteShipment(state.shipments.find(s=>s.id===b.dataset.deleteShipment)));
   $('#setup-bot').onclick=showBotSetup;
   $('#managers').onclick=editManagers;
   document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editShipment(state.shipments.find(s=>s.id===b.dataset.edit)));
+}
+function deleteShipment(shipment){
+  showDialog('Удалить поставку?',`<p><strong>${esc(shipment.title)}</strong></p><p>Поставка и её товары исчезнут из приложения. Отменённые резервы останутся в истории администратора. Поставку с действующими резервами удалить нельзя.</p><p id="delete-error" class="error" role="alert"></p><button class="danger full" id="delete-shipment">Удалить поставку</button>`);
+  const error=$('#delete-error'),button=$('#delete-shipment');
+  button.onclick=async()=>{
+    button.disabled=true;error.textContent='';
+    try{
+      await api('/admin/shipments/'+encodeURIComponent(shipment.id),'DELETE');
+      state.shipments=state.shipments.filter(s=>s.id!==shipment.id);
+      if(state.current===shipment.id){state.current=null;state.cart={};state.requestKey=null;}
+      closeDialog();render();toast('Поставка удалена.');
+    }catch(e){error.textContent=e.message;button.disabled=false;}
+  };
 }
 async function editManagers(){
   let list;
@@ -228,33 +250,69 @@ function showBotSetup(){
   };
 }
 function editShipment(existing){
+  importController?.abort();
   let products=existing?.products.map(p=>({...p,total:p.total??p.stock})),warnings=[];
-  showDialog(existing?'Настройки поставки':'Новая поставка',`<form id="shipment-form"><label class="field">Название<input name="title" required maxlength="160" value="${esc(existing?.title||'')}" placeholder="Например, Gurdini Slim Series"></label><div class="form-grid"><label class="field">Бренд<input name="brand" maxlength="80" value="${esc(existing?.brand||'')}"></label><label class="field">Статус<select name="status">${Object.entries(statuses).filter(([k])=>['draft','in_transit','arrived','closed'].includes(k)).map(([k,v])=>`<option value="${k}" ${existing?.status===k?'selected':''}>${v}</option>`).join('')}</select></label><label class="field">Ожидаемое поступление<input type="date" name="eta" value="${esc(existing?.eta||'')}"></label><label class="field">Дата публикации<input type="date" name="publishedAt" value="${esc(existing?.publishedAt||'')}"></label></div><label class="field">Описание<textarea name="description" maxlength="3000">${esc(existing?.description||'')}</textarea></label><label class="field">${existing?'Обновить товары из Excel':'Excel с товарами'}<input type="file" id="xlsx-file" accept=".xlsx"></label><p class="fine-print">Кол-во в Excel — общее количество поставки до вычета резервов. При обновлении действующие резервы сохраняются.</p><div id="import-info">${products?`<p class="import-summary">${products.length} позиций</p>`:''}</div><p id="import-error" class="error" role="alert"></p><button class="primary full" id="save-shipment" type="submit" ${products?'':'disabled'}>Сохранить поставку</button></form>`);
+  showDialog(existing?'Настройки поставки':'Новая поставка',`<form id="shipment-form"><label class="field">Название<input name="title" required maxlength="160" value="${esc(existing?.title||'')}" placeholder="Например, Gurdini Slim Series"></label><div class="form-grid"><label class="field">Бренд<input name="brand" maxlength="80" value="${esc(existing?.brand||'')}"></label><label class="field">Статус<select name="status">${Object.entries(statuses).filter(([k])=>['draft','in_transit','arrived','closed'].includes(k)).map(([k,v])=>`<option value="${k}" ${existing?.status===k?'selected':''}>${v}</option>`).join('')}</select></label><label class="field">Ожидаемое поступление<input type="date" name="eta" value="${esc(existing?.eta||'')}"></label><label class="field">Дата публикации<input type="date" name="publishedAt" value="${esc(existing?.publishedAt||'')}"></label></div><label class="field">Описание<textarea name="description" maxlength="3000">${esc(existing?.description||'')}</textarea></label><label class="field">${existing?'Обновить товары из Excel':'Excel с товарами'}<input type="file" id="xlsx-file" accept=".xls,.xlsx"></label><p class="fine-print">Кол-во в Excel — общее количество поставки до вычета резервов. При обновлении действующие резервы сохраняются.</p><div id="import-info">${products?`<p class="import-summary">${products.length} позиций</p>`:''}</div><p id="import-error" class="error" role="alert"></p><button class="primary full" id="save-shipment" type="submit" ${products?'':'disabled'}>Сохранить поставку</button></form>`);
   const form=$('#shipment-form');
   $('#xlsx-file').onchange=async e=>{
-    const file=e.target.files[0];if(!file)return;$('#save-shipment').disabled=true;$('#import-info').textContent='Читаем Excel и сжимаем фотографии…';$('#import-error').textContent='';
+    const file=e.target.files[0];if(!file)return;
+    importController?.abort();const controller=new AbortController();importController=controller;
+    products=null;warnings=[];
+    $('#save-shipment').disabled=true;$('#import-info').textContent='Читаем Excel и сжимаем фотографии…';$('#import-error').textContent='';
     try{
-      const result=await readSupplierXlsx(file);products=result.products;warnings=result.warnings;
-      if(!form.elements.title.value)form.elements.title.value=file.name.replace(/\.xlsx$/i,'');
-      $('#import-info').innerHTML=`<div class="import-summary">${products.length} позиций · ${products.filter(p=>p.image).length} фотографий</div>${warnings.length?`<details class="warning"><summary>Замечания: ${warnings.length}</summary>${warnings.map(w=>`<div>${esc(w)}</div>`).join('')}</details><label class="field"><input id="accept-warnings" type="checkbox" style="width:auto;min-height:auto"> Проверил замечания</label>`:''}<div class="import-preview"><table><thead><tr><th>Товар</th><th>Кол-во</th><th>Цена</th></tr></thead><tbody>${products.map(p=>`<tr><td>${esc(p.name)}<br>${esc(p.sku)}</td><td>${p.stock}</td><td>${money(p.price)}</td></tr>`).join('')}</tbody></table></div>`;
+      const result=await readSupplierExcel(file,{signal:controller.signal});
+      if(controller.signal.aborted||!form.isConnected)return;
+      products=result.products;warnings=result.warnings;
+      if(!form.elements.title.value)form.elements.title.value=file.name.replace(/\.xlsx?$/i,'');
+      $('#import-info').innerHTML=`<div class="import-summary">${products.length} позиций · ${products.filter(p=>p.image).length} фотографий</div>${warnings.length?`<details class="warning"><summary>Замечания: ${warnings.length}</summary>${warnings.map(w=>`<div>${esc(w)}</div>`).join('')}</details><label class="field"><input id="accept-warnings" type="checkbox" style="width:auto;min-height:auto"> Проверил замечания</label>`:''}<div class="import-preview"><table><thead><tr><th>Товар</th><th>Кол-во</th><th>Цена</th></tr></thead><tbody>${products.map(p=>`<tr><td>${esc(p.name)}<br>${esc(p.sku)}</td><td>${p.stock}</td><td>${p.price===null?`<input data-import-price="${esc(p.id)}" type="number" inputmode="decimal" required min="0" max="1000000" step="0.01" placeholder="Цена, ₽" aria-label="Цена ${esc(p.sku)}">`:money(p.price)}</td></tr>`).join('')}</tbody></table></div>`;
+      form.querySelectorAll('[data-import-price]').forEach(input=>input.oninput=()=>{const product=products.find(p=>p.id===input.dataset.importPrice);product.price=input.value.trim()&&input.validity.valid?Math.round(Number(input.value)*100):null;});
       $('#save-shipment').disabled=false;
-    }catch(e){products=null;$('#import-info').textContent='';$('#import-error').textContent=e.message;}
+    }catch(e){if(controller.signal.aborted||!form.isConnected)return;products=null;$('#import-info').textContent='';$('#import-error').textContent=e.message;}
   };
   form.onsubmit=async e=>{
     e.preventDefault();if(!products)return;
+    if(products.some(p=>p.price===null)){$('#import-error').textContent='Заполните цены всех товаров перед сохранением.';return;}
     if(warnings.length&&!$('#accept-warnings')?.checked){$('#import-error').textContent='Подтвердите проверку замечаний.';return;}
     const b=$('#save-shipment');b.disabled=true;$('#import-error').textContent='';
     try{await api('/admin/shipments','POST',{id:existing?.id||crypto.randomUUID(),...Object.fromEntries(new FormData(form)),products});closeDialog();await refresh();toast('Поставка сохранена.');}catch(e){if($('#import-error')){$('#import-error').textContent=e.message;b.disabled=false;}else toast(e.message);}
   };
 }
 function goBack(){if(Object.keys(state.cart).length){showDialog('Вернуться к поставкам?',`<p>Выбранные количества будут сброшены.</p><button class="primary full" id="leave">Вернуться</button>`);$('#leave').onclick=()=>{closeDialog();state.cart={};state.current=null;state.requestKey=null;render();};}else{state.current=null;render();}}
-async function refresh(){
-  try{if(!state.preview)state.shipments=(await api('/catalog')).shipments;render();}catch(e){toast(e.message);}
+async function refresh({background=false}={}){
+  if(state.preview){if(!background)render();return;}
+  if(background&&document.activeElement?.matches('[data-qty]'))return;
+  if(refreshPromise){await refreshPromise;if(background)return;}
+  const button=$('#refresh');button.disabled=true;
+  refreshPromise=(async()=>{
+    try{
+      const previous=JSON.stringify(state.shipments);
+      const shipments=(await api('/catalog')).shipments;
+      if(background&&dialog.open)return;
+      state.shipments=shipments;
+      const changed=previous!==JSON.stringify(state.shipments);
+      if(background && (!changed||dialog.open))return;
+      if(state.view==='shipments' && $('#shipment-grid')){cards();$('.count').textContent=state.shipments.length+' поставки';cartBar();return;}
+      if(state.view==='shipments' && $('#product-search')){
+        const input=$('#product-search'),query=input.value,focused=document.activeElement;
+        if(!activeShipment()){state.current=null;state.cart={};state.requestKey=null;render();return;}
+        if(!changed)return;
+        const selection=focused?.matches('[data-qty]')?focused.dataset.qty:null;
+        renderDetail();$('#product-search').value=query;products(query);cartBar();
+        if(focused===input)$('#product-search').focus({preventScroll:true});
+        else if(selection)app.querySelector(`[data-qty="${CSS.escape(selection)}"]`)?.focus({preventScroll:true});
+        return;
+      }
+      if(!background||changed)render();
+    }catch(e){toast(e.message);}
+    finally{button.disabled=false;refreshPromise=null;}
+  })();
+  return refreshPromise;
 }
 document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{state.view=b.dataset.view;render();window.scrollTo(0,0);});
-$('#refresh').onclick=refresh;
+$('#refresh').onclick=()=>refresh();
+dialog.addEventListener('close',()=>importController?.abort());
 $('.brand').onclick=e=>{e.preventDefault();state.view='shipments';if(state.current)goBack();else render();};
 tg?.BackButton?.onClick(goBack);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!state.preview&&!dialog.open)refresh();});
-setInterval(()=>{if(!state.preview&&!document.hidden&&!dialog.open&&state.view==='shipments'&&tg?.initData)refresh();},45000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!state.preview&&!dialog.open)refresh({background:true});});
+setInterval(()=>{if(!state.preview&&!document.hidden&&!dialog.open&&state.view==='shipments'&&tg?.initData)refresh({background:true});},45000);
 init();

@@ -1,3 +1,4 @@
+import {parseSupplierRows} from './supplier-rows.js';
 // Supplier XLSX reader: reads cells and DrawingML anchors, then compresses images.
 // All processing stays in the owner's browser until Save is pressed.
 const xml = text => {
@@ -28,8 +29,37 @@ async function compress(bytes) {
     return canvas.toDataURL('image/webp',.7);
   } finally {URL.revokeObjectURL(url);}
 }
-export async function readSupplierXlsx(file) {
+export async function readSupplierExcel(file,{signal}={}) {
+  if(!/\.xlsx?$/i.test(file.name))throw Error('Выберите файл .xls или .xlsx.');
   if(file.size>25*1024*1024)throw Error('Excel должен быть не больше 25 МБ.');
+  signal?.throwIfAborted();
+  const bytes=await file.arrayBuffer();
+  signal?.throwIfAborted();
+  if(new Uint8Array(bytes)[0]===0x50)return readXlsx(bytes,signal);
+  const result=await readLegacy(bytes,signal);
+  for(const picture of result.pictures) {
+    signal?.throwIfAborted();
+    const product=result.products.find(p=>p.id===picture.id);
+    try{product.image=await compress(picture.bytes);}catch{result.warnings.push(`${product.sku}: не удалось прочитать фотографию.`);}
+  }
+  signal?.throwIfAborted();
+  for(const product of result.products)if(!product.image)result.warnings.push(`${product.sku}: фотография отсутствует или её формат не поддерживается.`);
+  return {products:result.products,warnings:result.warnings};
+}
+function readLegacy(bytes,signal) {
+  return new Promise((resolve,reject)=>{
+    const worker=new Worker(new URL('./xls-worker.js',import.meta.url));
+    const finish=(error,result)=>{worker.terminate();signal?.removeEventListener('abort',abort);clearTimeout(timer);error?reject(error):resolve(result);};
+    const abort=()=>finish(new DOMException('Импорт отменён','AbortError'));
+    const timer=setTimeout(()=>finish(Error('Чтение Excel заняло слишком много времени. Попробуйте уменьшить файл.')),60000);
+    signal?.addEventListener('abort',abort,{once:true});
+    if(signal?.aborted){abort();return;}
+    worker.onerror=()=>finish(Error('Не удалось запустить обработчик XLS. Обновите приложение и повторите загрузку.'));
+    worker.onmessage=({data})=>finish(data.error?Error(data.error):null,data);
+    worker.postMessage(bytes,[bytes]);
+  });
+}
+async function readXlsx(file,signal) {
   const zip=await window.JSZip.loadAsync(file);
   let unpacked=0;
   for(const f of Object.values(zip.files)) {
@@ -39,7 +69,7 @@ export async function readSupplierXlsx(file) {
   const workbook=zip.file('xl/workbook.xml');if(!workbook)throw Error('Нужен файл .xlsx.');
   const wr=await relations(zip,'xl/workbook.xml');
   const sheet=nodes(xml(await workbook.async('text')),'sheet')[0];
-  const path=wr[sheet.getAttribute('r:id')];
+  const path=sheet&&wr[sheet.getAttribute('r:id')];
   if(!path || !zip.file(path))throw Error('Лист Excel не найден.');
   const doc=xml(await zip.file(path).async('text'));
   const ss=zip.file('xl/sharedStrings.xml');
@@ -54,29 +84,13 @@ export async function readSupplierXlsx(file) {
     }
     rows.set(Number(r.getAttribute('r')),cells);
   }
-  let header=null;
-  for(const [n,r] of rows)if(Object.values(r).some(v=>/^наименование$/i.test((v||'').trim()))) {header=[n,r];break;}
-  if(!header)throw Error('Не найден столбец «Наименование».');
-  const col=(regex)=>Object.entries(header[1]).find(([,v])=>regex.test((v||'').trim()))?.[0];
-  const c={name:col(/^наименование$/i),sku:col(/^артикул$/i),stock:col(/^кол-во$/i),price:col(/^опт\.?$/i),unit:col(/^ед\.\s*изм\.?$/i)};
-  if(!c.sku || !c.stock || !c.price)throw Error('Нужны столбцы Артикул, Кол-во и Опт.');
-  const products=[],warnings=[],rowProducts=new Map(),seen=new Set();
-  for(const [n,r] of rows) {
-    if(n<=header[0] || !r[c.name])continue;
-    const sku=String(r[c.sku] || '').trim(),stock=Number(String(r[c.stock]??'').replace(',','.')),price=Number(String(r[c.price]??'').replace(',','.'));
-    if(!/^[a-zA-Z0-9_-]{1,80}$/.test(sku) || seen.has(sku))throw Error(`Строка ${n}: некорректный или повторный артикул.`);
-    if(!String(r[c.stock]??'').trim() || !String(r[c.price]??'').trim() || !Number.isSafeInteger(stock) || !Number.isFinite(price) || price<0)throw Error(`Строка ${n}: проверьте цену и количество.`);
-    seen.add(sku);
-    if(stock<0)warnings.push(`${sku}: количество ${stock} заменено на 0.`);
-    const product={id:sku,sku,name:r[c.name].trim(),stock:Math.max(0,stock),price:Math.round(price*100),unit:r[c.unit]||'шт',image:null};
-    products.push(product);rowProducts.set(n,product);
-  }
-  if(!products.length || products.length>3000)throw Error('Допустимо от 1 до 3000 товаров.');
+  const {products,warnings,rowProducts}=parseSupplierRows(rows);
   const sr=await relations(zip,path);
   for(const drawing of nodes(doc,'drawing')) {
     const dp=sr[drawing.getAttribute('r:id')];if(!dp || !zip.file(dp))continue;
     const dd=xml(await zip.file(dp).async('text')),dr=await relations(zip,dp);
     for(const anchor of [...nodes(dd,'twoCellAnchor'),...nodes(dd,'oneCellAnchor')]) {
+      signal?.throwIfAborted();
       const from=nodes(anchor,'from')[0];if(!from)continue;
       const row=Number(textOf(from,'row'))+1,p=rowProducts.get(row);if(!p)continue;
       const blip=nodes(anchor,'blip')[0],imagePath=blip && dr[blip.getAttribute('r:embed')];
@@ -86,6 +100,7 @@ export async function readSupplierXlsx(file) {
       }
     }
   }
+  signal?.throwIfAborted();
   for(const p of products)if(!p.image)warnings.push(`${p.sku}: фотография отсутствует.`);
   return {products,warnings};
 }

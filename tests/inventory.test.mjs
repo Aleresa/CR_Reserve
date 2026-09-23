@@ -286,3 +286,35 @@ test('an update arriving during Telegram delivery is still queued and eventually
   assert.equal(store.inventory.rows('SELECT * FROM outbox WHERE sent=0').length,1);
   await store.flush();assert.deepEqual(calls.map(c=>c.method),['sendMessage','editMessageText']);assert.match(calls[1].body.text,/1 шт/);
 });
+
+test('cancelled reservations leave client list but stay in admin history',()=>{
+  const {inv}=fixture();const cancelled=inv.reserve(user,request('cancel-me'));
+  const active=inv.reserve(user,request('keep-me',1));
+  inv.changeReservation(user,cancelled.id,'cancelled');
+  assert.deepEqual(inv.reservations(user).map(r=>r.id),[active.id]);
+  assert.equal(inv.reservations(user,true).find(r=>r.id===cancelled.id).status,'cancelled');
+});
+test('shipment deletion blocks active and confirmed reserves, preserves cancelled history and retry keys',()=>{
+  const {inv}=fixture(),r=inv.reserve(user,request('key'));
+  assert.throws(()=>inv.deleteShipment('sample'),/действующие резервы/);
+  inv.changeReservation(user,r.id,'confirmed',true);assert.throws(()=>inv.deleteShipment('sample'),/действующие резервы/);
+  assert.equal(inv.catalog()[0].products[0].stock,7);
+  inv.changeReservation(user,r.id,'cancelled',true);
+  assert.deepEqual(inv.deleteShipment('sample'),{deleted:true});
+  assert.equal(inv.catalog(true).length,0);assert.equal(inv.rows('SELECT * FROM products').length,0);
+  assert.equal(inv.reservations(user,true)[0].status,'cancelled');
+  assert.equal(inv.reserve(user,request('key')).status,'cancelled');
+  assert.deepEqual(inv.deleteShipment('sample'),{deleted:true});
+  assert.throws(()=>inv.reserve(user,request('new')),/закрыт/);
+});
+test('shipment deletion requires administrator identity and is transactional',async()=>{
+  const {sql,txn,inv}=fixture(),token='test:delete';
+  const store=new ReserveStore({storage:{sql,transactionSync:txn},waitUntil:()=>{}},{BOT_TOKEN:token,ADMIN_IDS:'999'});
+  const remove=data=>store.fetch(new Request('https://app/api/admin/shipments/sample',{method:'DELETE',headers:{'X-Telegram-Init-Data':data}}));
+  assert.equal((await remove('')).status,401);assert.equal((await remove(signedData(token))).status,403);
+  const exec=sql.exec;sql.exec=(q,...args)=>{if(q==='DELETE FROM shipments WHERE id=?')throw Error('disk full');return exec(q,...args);};
+  assert.throws(()=>inv.deleteShipment('sample'),/disk full/);assert.equal(inv.catalog()[0].products.length,2);
+  sql.exec=exec;
+  const owner=signedData(token,{user:JSON.stringify({id:999,first_name:'Owner'})});
+  assert.equal((await remove(owner)).status,200);assert.equal(inv.catalog(true).length,0);
+});

@@ -14,6 +14,8 @@ export class Inventory {
     sql.exec(`CREATE TABLE IF NOT EXISTS reservations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, shipment TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(user_id,request_key))`);
     sql.exec(`CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, data TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0)`);
     sql.exec('CREATE TABLE IF NOT EXISTS reservation_edits (user_id TEXT NOT NULL, request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(user_id,request_key))');
+    sql.exec('CREATE INDEX IF NOT EXISTS reservations_user_status ON reservations(user_id,status)');
+    sql.exec('CREATE INDEX IF NOT EXISTS reservations_shipment_status ON reservations(shipment,status)');
     sql.exec('CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
   }
   rows(query,...bindings) { return [...this.sql.exec(query,...bindings)]; }
@@ -38,6 +40,18 @@ export class Inventory {
   catalog(admin=false) {
     return this.rows('SELECT data FROM shipments').map(r=>JSON.parse(r.data)).filter(s=>admin || s.status !== 'draft').map(s=>({...s,products:this.rows('SELECT * FROM products WHERE shipment=?',s.id).map(p=>({...JSON.parse(p.data),stock:p.total-p.reserved,...(admin?{total:p.total,reserved:p.reserved}:{})}))}));
   }
+  deleteShipment(id) {
+    if(!validId(id))throw new ApiError(400,'Некорректная поставка.');
+    return this.transaction(()=>{
+      if(!this.one('SELECT id FROM shipments WHERE id=?',id))return {deleted:true};
+      const active=this.one("SELECT id FROM reservations WHERE shipment=? AND status IN ('reserved','confirmed') LIMIT 1",id);
+      if(active || this.one('SELECT id FROM products WHERE shipment=? AND reserved>0 LIMIT 1',id))throw new ApiError(409,'В поставке есть действующие резервы. Сначала отмените их. Чтобы оставить резервы и прекратить приём новых, закройте поставку в настройках.');
+      this.sql.exec('DELETE FROM products WHERE shipment=?',id);
+      this.sql.exec('DELETE FROM shipments WHERE id=?',id);
+      // Reservation snapshots and notification history remain available to the owner.
+      return {deleted:true};
+    });
+  }
   importShipment(input) {
     if (!validId(input.id) || !trim(input.title,160) || !STATUSES.has(input.status) || !Array.isArray(input.products) || !input.products.length || input.products.length>3000) throw new ApiError(400,'Проверьте название, статус и список товаров.');
     for (const d of [input.eta,input.publishedAt]) if (d != null && d !== '' && (!/^\d{4}-\d{2}-\d{2}$/.test(d) || !Number.isFinite(Date.parse(d)) || new Date(d).toISOString().slice(0,10)!==d)) throw new ApiError(400,'Некорректная дата.');
@@ -57,8 +71,9 @@ export class Inventory {
     return this.transaction(()=>{
       const current=this.rows('SELECT id,reserved FROM products WHERE shipment=?',shipment.id);
       for(const p of current) if(p.reserved && !ids.has(p.id)) throw new ApiError(409,'Нельзя удалить товар с действующими резервами.');
+      const byId=new Map(current.map(p=>[p.id,p]));
       for(const p of products) {
-        const existing=current.find(x=>x.id===p.id);
+        const existing=byId.get(p.id);
         if((existing?.reserved || 0)>p.total) throw new ApiError(409,`${p.sku}: количество меньше уже зарезервированного.`);
       }
       this.sql.exec('INSERT INTO shipments(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',shipment.id,JSON.stringify(shipment));
@@ -149,7 +164,7 @@ export class Inventory {
     });
   }
   reservations(user,admin=false) {
-    const rows=admin?this.rows('SELECT * FROM reservations ORDER BY rowid DESC LIMIT 1000'):this.rows('SELECT * FROM reservations WHERE user_id=? ORDER BY rowid DESC LIMIT 1000',user.id);
+    const rows=admin?this.rows('SELECT * FROM reservations ORDER BY rowid DESC LIMIT 1000'):this.rows("SELECT * FROM reservations WHERE user_id=? AND status!='cancelled' ORDER BY rowid DESC LIMIT 1000",user.id);
     return rows.map(r=>({...JSON.parse(r.data),status:r.status}));
   }
   changeReservation(user,id,status,admin=false,expectedRevision) {
